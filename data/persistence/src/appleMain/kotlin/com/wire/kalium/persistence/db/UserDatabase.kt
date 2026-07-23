@@ -23,6 +23,8 @@ package com.wire.kalium.persistence.db
 import app.cash.sqldelight.async.coroutines.synchronous
 import app.cash.sqldelight.db.SqlDriver
 import app.cash.sqldelight.driver.native.NativeSqliteDriver
+import co.touchlab.sqliter.DatabaseFileContext.databasePath
+import co.touchlab.sqliter.DatabaseFileContext.deleteDatabase
 import com.wire.kalium.persistence.UserDatabase
 import com.wire.kalium.persistence.dao.UserIDEntity
 import com.wire.kalium.persistence.util.FileNameUtil
@@ -144,7 +146,13 @@ internal actual fun nuke(
     platformDatabaseData: PlatformDatabaseData
 ): Boolean {
     return when (platformDatabaseData.storageData) {
-        is StorageData.FileBacked -> NSFileManager.defaultManager.removeItemAtPath(platformDatabaseData.storageData.storePath, null)
+        is StorageData.FileBacked -> {
+            // Delete only this user's DB file (and its -wal/-shm siblings), never the whole storage
+            // directory, which is shared with the live user DB and other users' databases.
+            deleteDatabase(FileNameUtil.userDBName(userId), platformDatabaseData.storageData.storePath)
+            true
+        }
+
         is StorageData.InMemory -> clearInMemoryDatabase(userId)
     }
 }
@@ -153,11 +161,13 @@ internal actual fun getDatabaseAbsoluteFileLocation(
     platformDatabaseData: PlatformDatabaseData,
     userId: UserIDEntity
 ): String? {
-    return if (
-        platformDatabaseData.storageData is StorageData.FileBacked && NSURL.fileURLWithPath(platformDatabaseData.storageData.storePath)
-            .checkResourceIsReachableAndReturnError(null)
-    ) {
-        platformDatabaseData.storageData.storePath
+    if (platformDatabaseData.storageData !is StorageData.FileBacked) {
+        return null
+    }
+    // The DB file lives at storePath/<userDBName> (SQLiter basePath + name), not at storePath itself.
+    val dbFilePath = databasePath(FileNameUtil.userDBName(userId), platformDatabaseData.storageData.storePath)
+    return if (NSURL.fileURLWithPath(dbFilePath).checkResourceIsReachableAndReturnError(null)) {
+        dbFilePath
     } else {
         null
     }
@@ -166,4 +176,22 @@ internal actual fun getDatabaseAbsoluteFileLocation(
 internal actual fun createEmptyDatabaseFile(
     platformDatabaseData: PlatformDatabaseData,
     userId: UserIDEntity,
-): String? = TODO()
+): String? {
+    if (platformDatabaseData.storageData !is StorageData.FileBacked) {
+        return null
+    }
+    val storePath = platformDatabaseData.storageData.storePath
+    val fileManager = NSFileManager.defaultManager
+    // Make sure the storage directory exists before creating the file inside it.
+    fileManager.createDirectoryAtPath(storePath, true, null, null)
+
+    val dbFilePath = databasePath(FileNameUtil.userDBName(userId), storePath)
+    // Remove any stale DB (and its -wal/-shm siblings) so we start from a truly empty file.
+    deleteDatabase(FileNameUtil.userDBName(userId), storePath)
+
+    return if (fileManager.createFileAtPath(dbFilePath, null, null)) {
+        dbFilePath
+    } else {
+        null
+    }
+}
