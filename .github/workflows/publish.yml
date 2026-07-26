@@ -6,7 +6,7 @@ on:
       version:
         description: "Immutable coordinate version (YYYY.MM.DD.wireN)"
         required: true
-        default: "2026.07.26.wire1"
+        default: "2026.07.26.wire2"
         type: string
       upstream_kmp_sha:
         description: "Exact mirrored wireapp/kalium develop SHA"
@@ -129,7 +129,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          release_id="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              | jq -r --arg tag "$TAG" --arg name "Kalium $VERSION" '
+                  .[]
+                  | select(.tag_name == $tag or .name == $name)
+                  | .id
+                ' \
+              | head -1
+          )"
+          if [ -n "$release_id" ]; then
             echo "::error::Release '$TAG' already exists; version is immutable."
             exit 1
           fi
@@ -190,21 +199,27 @@ jobs:
             echo "- Maven feed: \`$KALIUM_PUBLISH_URL\`"
           } > "$notes"
 
-          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
-            gh release create "$TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --draft \
-              --title "Kalium $VERSION" \
-              --notes-file "$notes" \
-              --verify-tag
-          else
-            gh release create "$TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --draft \
-              --target "$GITHUB_SHA" \
-              --title "Kalium $VERSION" \
-              --notes-file "$notes"
+          if [ "$GITHUB_EVENT_NAME" != "push" ]; then
+            gh api --method POST \
+              "repos/$GITHUB_REPOSITORY/git/refs" \
+              --raw-field ref="refs/tags/$TAG" \
+              --raw-field sha="$GITHUB_SHA" \
+              --silent
           fi
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --title "Kalium $VERSION" \
+            --notes-file "$notes" \
+            --verify-tag
+
+          release_id="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              | jq -r --arg tag "$TAG" '.[] | select(.tag_name == $tag) | .id' \
+              | head -1
+          )"
+          test -n "$release_id"
 
   lite:
     name: Build Kalium Lite XCFramework
@@ -675,7 +690,11 @@ jobs:
             --repo "$GITHUB_REPOSITORY"
           release_id="$(
             gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              | jq -r --arg tag "$TAG" '.[] | select(.tag_name == $tag) | .id' \
+              | jq -r --arg tag "$TAG" --arg name "Kalium $VERSION" '
+                  .[]
+                  | select(.tag_name == $tag or .name == $name)
+                  | .id
+                ' \
               | head -1
           )"
           test -n "$release_id"
@@ -720,7 +739,11 @@ jobs:
           } > "$notes"
           release_id="$(
             gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              | jq -r --arg tag "$TAG" '.[] | select(.tag_name == $tag) | .id' \
+              | jq -r --arg tag "$TAG" --arg name "Kalium $VERSION" '
+                  .[]
+                  | select(.tag_name == $tag or .name == $name)
+                  | .id
+                ' \
               | head -1
           )"
           test -n "$release_id"
