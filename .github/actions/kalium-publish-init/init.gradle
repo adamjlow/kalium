@@ -1,0 +1,62 @@
+// Injected into an unmodified Kalium checkout by .github/workflows/publish.yml.
+//
+// It adds:
+//   - WireForkStaging: a local Maven repository used to validate the complete
+//     publication set before any immutable remote upload.
+//   - WireForkGitHubPackages: adamjlow/kalium's GitHub Packages Maven feed.
+//
+// Kalium's existing publications, group IDs, and artifact IDs are retained.
+// No Maven Central publication task is invoked by the fork workflow.
+
+import org.gradle.api.publish.PublishingExtension
+import org.gradle.api.publish.maven.MavenPublication
+
+allprojects { project ->
+    project.plugins.withId('maven-publish') {
+        def publishVersion = project.providers
+            .gradleProperty('kalium.publish.version')
+            .orElse(project.providers.environmentVariable('KALIUM_PUBLISH_VERSION'))
+            .orNull
+
+        if (publishVersion == null || publishVersion.isBlank()) {
+            throw new GradleException(
+                'A publication version is required via -Pkalium.publish.version ' +
+                    'or KALIUM_PUBLISH_VERSION.'
+            )
+        }
+
+        project.extensions.configure(PublishingExtension) { publishing ->
+            publishing.publications
+                .withType(MavenPublication)
+                .configureEach { publication ->
+                    publication.version = publishVersion
+                }
+
+            publishing.repositories { repositories ->
+                repositories.maven { repository ->
+                    repository.name = 'WireForkStaging'
+                    repository.url = project.uri(
+                        System.getenv('KALIUM_STAGING_URL')
+                            ?: new File(project.rootProject.buildDir, 'wire-fork-staging')
+                    )
+                }
+
+                repositories.maven { repository ->
+                    repository.name = 'WireForkGitHubPackages'
+                    repository.url = project.uri(
+                        System.getenv('KALIUM_PUBLISH_URL')
+                            ?: 'https://maven.pkg.github.com/adamjlow/kalium'
+                    )
+                    repository.credentials { credentials ->
+                        credentials.username =
+                            System.getenv('KALIUM_PUBLISH_ACTOR')
+                                ?: System.getenv('GITHUB_ACTOR')
+                        credentials.password =
+                            System.getenv('KALIUM_PUBLISH_TOKEN')
+                                ?: System.getenv('GITHUB_TOKEN')
+                    }
+                }
+            }
+        }
+    }
+}

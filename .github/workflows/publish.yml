@@ -1,0 +1,730 @@
+name: Publish deterministic fork release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Immutable coordinate version (YYYY.MM.DD.wireN)"
+        required: true
+        default: "2026.07.26.wire1"
+        type: string
+      upstream_kmp_sha:
+        description: "Exact mirrored wireapp/kalium develop SHA"
+        required: true
+        default: "21eb17beac3ea4ba614e0784cfd0d4c9aaf7dba6"
+        type: string
+      upstream_lite_sha:
+        description: "Exact mirrored Kalium Lite SHA"
+        required: true
+        default: "6e7128b03d512dcf596758871704f595730257f5"
+        type: string
+      dry_run:
+        description: "Build and validate locally without publishing"
+        required: true
+        default: true
+        type: boolean
+  push:
+    tags:
+      - "fork-v*.wire*"
+
+concurrency:
+  group: kalium-fork-publish-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: write
+  packages: write
+
+env:
+  PINNED_KMP_SHA: "21eb17beac3ea4ba614e0784cfd0d4c9aaf7dba6"
+  PINNED_LITE_SHA: "6e7128b03d512dcf596758871704f595730257f5"
+  KALIUM_PUBLISH_URL: "https://maven.pkg.github.com/adamjlow/kalium"
+
+jobs:
+  prepare:
+    name: Validate and reserve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      kmp_sha: ${{ steps.release.outputs.kmp_sha }}
+      lite_sha: ${{ steps.release.outputs.lite_sha }}
+      dry_run: ${{ steps.release.outputs.dry_run }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Resolve immutable release inputs
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_KMP_SHA: ${{ inputs.upstream_kmp_sha }}
+          INPUT_LITE_SHA: ${{ inputs.upstream_lite_sha }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "push" ]; then
+            case "$GITHUB_REF_NAME" in
+              fork-v*.wire*) version="${GITHUB_REF_NAME#fork-v}" ;;
+              *)
+                echo "::error::Unexpected publish tag '$GITHUB_REF_NAME'."
+                exit 1
+                ;;
+            esac
+            kmp_sha="$PINNED_KMP_SHA"
+            lite_sha="$PINNED_LITE_SHA"
+            dry_run="false"
+          else
+            version="$INPUT_VERSION"
+            kmp_sha="$INPUT_KMP_SHA"
+            lite_sha="$INPUT_LITE_SHA"
+            dry_run="$INPUT_DRY_RUN"
+          fi
+
+          if ! [[ "$version" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.wire[1-9][0-9]*$ ]]; then
+            echo "::error::Version '$version' does not match YYYY.MM.DD.wireN."
+            exit 1
+          fi
+          if ! [[ "$kmp_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::KMP ref must be a full lowercase 40-character SHA."
+            exit 1
+          fi
+          if ! [[ "$lite_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Lite ref must be a full lowercase 40-character SHA."
+            exit 1
+          fi
+          if [ "$dry_run" != "true" ] && [ "$dry_run" != "false" ]; then
+            echo "::error::dry_run must be true or false."
+            exit 1
+          fi
+
+          tag="fork-v$version"
+          {
+            echo "version=$version"
+            echo "kmp_sha=$kmp_sha"
+            echo "lite_sha=$lite_sha"
+            echo "dry_run=$dry_run"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify both source commits exist in the fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KMP_SHA: ${{ steps.release.outputs.kmp_sha }}
+          LITE_SHA: ${{ steps.release.outputs.lite_sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/commits/$KMP_SHA" --silent
+          gh api "repos/$GITHUB_REPOSITORY/commits/$LITE_SHA" --silent
+
+      - name: Enforce version immutability
+        if: steps.release.outputs.dry_run == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUBLISH_ACTOR: ${{ github.actor }}
+          PUBLISH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release '$TAG' already exists; version is immutable."
+            exit 1
+          fi
+
+          tag_status="$(
+            curl --silent --output /dev/null --write-out '%{http_code}' \
+              --header "Authorization: Bearer $PUBLISH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG"
+          )"
+          if [ "$EVENT_NAME" = "push" ]; then
+            if [ "$tag_status" != "200" ]; then
+              echo "::error::Trigger tag '$TAG' is not readable (HTTP $tag_status)."
+              exit 1
+            fi
+          elif [ "$tag_status" != "404" ]; then
+            echo "::error::Tag '$TAG' is already reserved (HTTP $tag_status)."
+            exit 1
+          fi
+
+          module_url="$KALIUM_PUBLISH_URL/com/wire/kalium/logic/$VERSION/logic-$VERSION.module"
+          package_status="$(
+            curl --silent --output /dev/null --write-out '%{http_code}' \
+              --user "$PUBLISH_ACTOR:$PUBLISH_TOKEN" \
+              "$module_url"
+          )"
+          case "$package_status" in
+            404) ;;
+            200)
+              echo "::error::com.wire.kalium:logic:$VERSION already exists."
+              exit 1
+              ;;
+            *)
+              echo "::error::Unable to verify package immutability (HTTP $package_status)."
+              exit 1
+              ;;
+          esac
+
+      - name: Reserve release version as a draft
+        if: steps.release.outputs.dry_run == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+          KMP_SHA: ${{ steps.release.outputs.kmp_sha }}
+          LITE_SHA: ${{ steps.release.outputs.lite_sha }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "# Kalium fork $VERSION"
+            echo
+            echo "Publication is in progress. This version is now reserved and must not be reused."
+            echo
+            echo "- KMP upstream SHA: \`$KMP_SHA\`"
+            echo "- Lite upstream SHA: \`$LITE_SHA\`"
+            echo "- Pipeline commit: \`$GITHUB_SHA\`"
+            echo "- Maven feed: \`$KALIUM_PUBLISH_URL\`"
+          } > "$notes"
+
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --title "Kalium $VERSION" \
+              --notes-file "$notes" \
+              --verify-tag
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --target "$GITHUB_SHA" \
+              --title "Kalium $VERSION" \
+              --notes-file "$notes"
+          fi
+
+  lite:
+    name: Build Kalium Lite XCFramework
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      GRADLE_OPTS: "-Xmx4g -Dorg.gradle.workers.max=1 -Dorg.gradle.parallel=false"
+      VERSION: ${{ needs.prepare.outputs.version }}
+      LITE_SHA: ${{ needs.prepare.outputs.lite_sha }}
+    steps:
+      - name: Select Xcode 16.1
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90
+        with:
+          xcode-version: "16.1.0"
+
+      - name: Checkout exact mirrored Lite source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: adamjlow/kalium
+          ref: ${{ needs.prepare.outputs.lite_sha }}
+          path: source
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@0b6dd653ba04f4f93bf581ec31e66cbd7dcb644d
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@6cfc8b8e8bb586cc164bef1c478c1eea3a4d6a19
+
+      - name: Ensure Android SDK 36
+        run: |
+          set -euo pipefail
+          android_sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          sdkmanager_path="$android_sdk_root/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$sdkmanager_path" ]; then
+            sdkmanager_path="$(command -v sdkmanager || true)"
+          fi
+          if [ -z "$android_sdk_root" ] || [ -z "$sdkmanager_path" ] || [ ! -x "$sdkmanager_path" ]; then
+            echo "::error::The standard macOS runner did not provide an Android SDK with sdkmanager."
+            exit 1
+          fi
+          "$sdkmanager_path" --sdk_root="$android_sdk_root" \
+            "platform-tools" "build-tools;36.0.0" "platforms;android-36"
+
+      - name: Verify Lite source provenance
+        working-directory: source
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$LITE_SHA"
+          git diff --exit-code
+
+      - name: Assemble notification-extension XCFramework
+        working-directory: source
+        run: |
+          ./gradlew --no-daemon \
+            -PUSE_UNIFIED_CORE_CRYPTO=true \
+            -Pkalium.publish.version="$VERSION" \
+            :logic:notification-extension:assembleKaliumNotificationExtensionXCFramework
+
+      - name: Validate and package release XCFramework
+        id: package
+        run: |
+          set -euo pipefail
+          xcf="$GITHUB_WORKSPACE/source/logic/notification-extension/build/XCFrameworks/release/KaliumNotificationExtension.xcframework"
+          test -d "$xcf"
+          test -f "$xcf/Info.plist"
+
+          info_json="$RUNNER_TEMP/kalium-lite-info.json"
+          plutil -convert json -o "$info_json" "$xcf/Info.plist"
+          jq -e '
+            any(.AvailableLibraries[];
+              .SupportedPlatform == "ios"
+              and (.SupportedPlatformVariant // "") != "simulator"
+              and (.SupportedArchitectures | index("arm64")))
+          ' "$info_json" >/dev/null
+          jq -e '
+            any(.AvailableLibraries[];
+              .SupportedPlatform == "ios"
+              and .SupportedPlatformVariant == "simulator"
+              and (.SupportedArchitectures | index("arm64")))
+          ' "$info_json" >/dev/null
+          jq -e '
+            any(.AvailableLibraries[];
+              .SupportedPlatform == "macos"
+              and (.SupportedArchitectures | index("arm64")))
+          ' "$info_json" >/dev/null
+
+          asset="KaliumNotificationExtension-$VERSION.xcframework.zip"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$xcf" "$GITHUB_WORKSPACE/$asset"
+          shasum -a 256 "$GITHUB_WORKSPACE/$asset" \
+            > "$GITHUB_WORKSPACE/$asset.sha256"
+          test -s "$GITHUB_WORKSPACE/$asset"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Upload validated Lite build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: kalium-lite-${{ needs.prepare.outputs.version }}
+          path: |
+            KaliumNotificationExtension-${{ needs.prepare.outputs.version }}.xcframework.zip
+            KaliumNotificationExtension-${{ needs.prepare.outputs.version }}.xcframework.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  kmp:
+    name: Stage, publish, and smoke full KMP
+    needs:
+      - prepare
+      - lite
+    runs-on: macos-15
+    timeout-minutes: 240
+    env:
+      GRADLE_OPTS: "-Xmx4g -Dorg.gradle.workers.max=1 -Dorg.gradle.parallel=false"
+      VERSION: ${{ needs.prepare.outputs.version }}
+      KMP_SHA: ${{ needs.prepare.outputs.kmp_sha }}
+      DRY_RUN: ${{ needs.prepare.outputs.dry_run }}
+      KALIUM_PUBLISH_VERSION: ${{ needs.prepare.outputs.version }}
+      KALIUM_PUBLISH_ACTOR: ${{ github.actor }}
+      KALIUM_PUBLISH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Select Xcode 16.1
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90
+        with:
+          xcode-version: "16.1.0"
+
+      - name: Checkout pipeline files
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          path: pipeline
+          persist-credentials: false
+
+      - name: Checkout exact mirrored KMP source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: adamjlow/kalium
+          ref: ${{ needs.prepare.outputs.kmp_sha }}
+          path: source
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@0b6dd653ba04f4f93bf581ec31e66cbd7dcb644d
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@6cfc8b8e8bb586cc164bef1c478c1eea3a4d6a19
+
+      - name: Ensure Android SDK 36
+        run: |
+          set -euo pipefail
+          android_sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          sdkmanager_path="$android_sdk_root/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$sdkmanager_path" ]; then
+            sdkmanager_path="$(command -v sdkmanager || true)"
+          fi
+          if [ -z "$android_sdk_root" ] || [ -z "$sdkmanager_path" ] || [ ! -x "$sdkmanager_path" ]; then
+            echo "::error::The standard macOS runner did not provide an Android SDK with sdkmanager."
+            exit 1
+          fi
+          "$sdkmanager_path" --sdk_root="$android_sdk_root" \
+            "platform-tools" "build-tools;36.0.0" "platforms;android-36"
+
+      - name: Configure local staging repository
+        run: echo "KALIUM_STAGING_URL=$RUNNER_TEMP/kalium-staging" >> "$GITHUB_ENV"
+
+      - name: Verify KMP source provenance
+        working-directory: source
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$KMP_SHA"
+          git diff --exit-code
+
+      - name: Discover and validate publication topology
+        working-directory: source
+        run: |
+          set -euo pipefail
+          init="$GITHUB_WORKSPACE/pipeline/.github/actions/kalium-publish-init/init.gradle"
+          tasks_file="$RUNNER_TEMP/kalium-publish-tasks.txt"
+          publications="$RUNNER_TEMP/kalium-publications.txt"
+          modules="$RUNNER_TEMP/kalium-modules.txt"
+          suffix="PublicationToWireForkStagingRepository"
+
+          ./gradlew --no-daemon --console=plain --quiet \
+            --init-script "$init" \
+            -PUSE_UNIFIED_CORE_CRYPTO=true \
+            -Pkalium.publish.version="$VERSION" \
+            tasks --all > "$tasks_file"
+
+          awk '{print $1}' "$tasks_file" \
+            | grep -E "publish[A-Za-z0-9]+${suffix}$" \
+            | sort -u > "$publications"
+          sed -E "s/:publish[A-Za-z0-9]+${suffix}$//" "$publications" \
+            | sort -u > "$modules"
+
+          publication_count="$(wc -l < "$publications" | tr -d ' ')"
+          module_count="$(wc -l < "$modules" | tr -d ' ')"
+          test "$publication_count" = "148"
+          test "$module_count" = "22"
+
+          while IFS= read -r project_path; do
+            for publication in KotlinMultiplatform Jvm Android IosArm64 IosSimulatorArm64; do
+              task="${project_path}:publish${publication}${suffix}"
+              if ! grep -Fxq "$task" "$publications"; then
+                echo "::error::Missing required publication task '$task'."
+                exit 1
+              fi
+            done
+          done < "$modules"
+
+          cp "$publications" "$GITHUB_WORKSPACE/kalium-publications-$VERSION.txt"
+
+      - name: Stage every publication locally
+        working-directory: source
+        run: |
+          init="$GITHUB_WORKSPACE/pipeline/.github/actions/kalium-publish-init/init.gradle"
+          ./gradlew --no-daemon \
+            --init-script "$init" \
+            -PUSE_UNIFIED_CORE_CRYPTO=true \
+            -Pkalium.publish.version="$VERSION" \
+            publishAllPublicationsToWireForkStagingRepository
+
+      - name: Validate staged artifacts and GMM closure
+        run: |
+          set -euo pipefail
+          stage="$KALIUM_STAGING_URL/com/wire/kalium"
+          modules="$RUNNER_TEMP/kalium-modules.txt"
+
+          while IFS= read -r project_path; do
+            artifact="${project_path//:/-}"
+            for suffix in "" "-jvm" "-android" "-iosarm64" "-iossimulatorarm64"; do
+              coordinate="$artifact$suffix"
+              directory="$stage/$coordinate/$VERSION"
+              test -s "$directory/$coordinate-$VERSION.module"
+              test -s "$directory/$coordinate-$VERSION.pom"
+            done
+            test -s "$stage/$artifact/$VERSION/$artifact-$VERSION.jar"
+            test -s "$stage/$artifact-jvm/$VERSION/$artifact-jvm-$VERSION.jar"
+            test -s "$stage/$artifact-android/$VERSION/$artifact-android-$VERSION.aar"
+            test -s "$stage/$artifact-iosarm64/$VERSION/$artifact-iosarm64-$VERSION.klib"
+            test -s "$stage/$artifact-iossimulatorarm64/$VERSION/$artifact-iossimulatorarm64-$VERSION.klib"
+          done < "$modules"
+
+          module_count="$(find "$stage" -type f -name '*.module' | wc -l | tr -d ' ')"
+          test "$module_count" = "148"
+
+          while IFS=$'\t' read -r dependency dependency_version; do
+            dependency_module="$stage/$dependency/$dependency_version/$dependency-$dependency_version.module"
+            if [ ! -s "$dependency_module" ]; then
+              echo "::error::GMM references unpublished coordinate com.wire.kalium:$dependency:$dependency_version."
+              exit 1
+            fi
+          done < <(
+            find "$stage" -type f -name '*.module' -print0 \
+              | xargs -0 jq -r '
+                  .variants[]?.dependencies[]?
+                  | select(.group == "com.wire.kalium")
+                  | [.module, .version.requires]
+                  | @tsv
+                ' \
+              | sort -u
+          )
+
+          (
+            cd "$KALIUM_STAGING_URL"
+            find . -type f -print0 \
+              | sort -z \
+              | xargs -0 shasum -a 256
+          ) > "$GITHUB_WORKSPACE/kalium-staging-$VERSION.sha256"
+
+          logic_module="$stage/logic/$VERSION/logic-$VERSION.module"
+          for variant in logic-jvm logic-android logic-iosarm64 logic-iossimulatorarm64; do
+            jq -e --arg variant "$variant" '
+              any(.variants[]?; ."available-at".module == $variant)
+            ' "$logic_module" >/dev/null
+          done
+
+      - name: Publish all publications to GitHub Packages
+        if: needs.prepare.outputs.dry_run == 'false'
+        working-directory: source
+        run: |
+          init="$GITHUB_WORKSPACE/pipeline/.github/actions/kalium-publish-init/init.gradle"
+          ./gradlew --no-daemon \
+            --init-script "$init" \
+            -PUSE_UNIFIED_CORE_CRYPTO=true \
+            -Pkalium.publish.version="$VERSION" \
+            publishAllPublicationsToWireForkGitHubPackagesRepository
+
+      - name: Verify remote GMM matches staged GMM
+        if: needs.prepare.outputs.dry_run == 'false'
+        run: |
+          set -euo pipefail
+          publications="$RUNNER_TEMP/kalium-publications.txt"
+          stage="$KALIUM_STAGING_URL/com/wire/kalium"
+          remote="$RUNNER_TEMP/remote-gmm"
+          mkdir -p "$remote"
+
+          while IFS= read -r task_path; do
+            project_path="${task_path%%:publish*}"
+            publication="${task_path#*:publish}"
+            publication="${publication%PublicationToWireForkStagingRepository}"
+            artifact="${project_path//:/-}"
+            case "$publication" in
+              KotlinMultiplatform) coordinate="$artifact" ;;
+              *) coordinate="$artifact-$(printf '%s' "$publication" | tr '[:upper:]' '[:lower:]')" ;;
+            esac
+
+            relative="$coordinate/$VERSION/$coordinate-$VERSION.module"
+            mkdir -p "$remote/$coordinate/$VERSION"
+            curl --fail --silent --show-error \
+              --retry 12 --retry-all-errors --retry-delay 10 \
+              --user "$KALIUM_PUBLISH_ACTOR:$KALIUM_PUBLISH_TOKEN" \
+              "$KALIUM_PUBLISH_URL/com/wire/kalium/$relative" \
+              --output "$remote/$relative"
+
+            expected="$(shasum -a 256 "$stage/$relative" | awk '{print $1}')"
+            actual="$(shasum -a 256 "$remote/$relative" | awk '{print $1}')"
+            test "$actual" = "$expected"
+          done < "$publications"
+
+      - name: Resolve logic from a clean environment
+        env:
+          SMOKE_ACTOR: ${{ github.actor }}
+          SMOKE_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          smoke="$RUNNER_TEMP/kalium-smoke"
+          mkdir -p "$smoke"
+
+          if [ "$DRY_RUN" = "true" ]; then
+            repository_url="$KALIUM_STAGING_URL"
+            credentials_block=""
+          else
+            repository_url="$KALIUM_PUBLISH_URL"
+            credentials_block='credentials {
+              username = System.getenv("SMOKE_ACTOR")
+              password = System.getenv("SMOKE_TOKEN")
+            }'
+          fi
+
+          cat > "$smoke/settings.gradle.kts" <<EOF
+          pluginManagement { repositories { gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven {
+                      url = uri("$repository_url")
+                      $credentials_block
+                      content { includeGroup("com.wire.kalium") }
+                  }
+              }
+          }
+          rootProject.name = "kalium-smoke"
+          EOF
+
+          cat > "$smoke/build.gradle.kts" <<EOF
+          plugins { id("java-library") }
+          dependencies {
+              implementation("com.wire.kalium:logic:$VERSION")
+          }
+          tasks.register("verifyKaliumResolution") {
+              doLast {
+                  val expected = "logic-jvm-$VERSION.jar"
+                  val resolved = configurations.compileClasspath.get().files.map { it.name }
+                  require(expected in resolved) {
+                      "Expected GMM to select \$expected, resolved: \$resolved"
+                  }
+                  println("RESOLVED_KALIUM_VARIANT=\$expected")
+              }
+          }
+          EOF
+
+          clean_gradle_home="$RUNNER_TEMP/kalium-smoke-gradle-home"
+          GRADLE_USER_HOME="$clean_gradle_home" \
+            "$GITHUB_WORKSPACE/source/gradlew" \
+              -p "$smoke" \
+              --no-daemon \
+              --refresh-dependencies \
+              verifyKaliumResolution \
+            | tee "$GITHUB_WORKSPACE/kalium-smoke-$VERSION.log"
+
+          grep -Fq "RESOLVED_KALIUM_VARIANT=logic-jvm-$VERSION.jar" \
+            "$GITHUB_WORKSPACE/kalium-smoke-$VERSION.log"
+
+      - name: Upload publication evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: kalium-kmp-evidence-${{ needs.prepare.outputs.version }}
+          path: |
+            kalium-publications-${{ needs.prepare.outputs.version }}.txt
+            kalium-staging-${{ needs.prepare.outputs.version }}.sha256
+            kalium-smoke-${{ needs.prepare.outputs.version }}.log
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          {
+            echo "## Kalium KMP publication"
+            echo
+            echo "- Version: \`$VERSION\`"
+            echo "- KMP SHA: \`$KMP_SHA\`"
+            echo "- Dry run: \`$DRY_RUN\`"
+            echo "- Feed: \`$KALIUM_PUBLISH_URL\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  finalize:
+    name: Publish GitHub Release
+    needs:
+      - prepare
+      - lite
+      - kmp
+    if: needs.prepare.outputs.dry_run == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Lite release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: kalium-lite-${{ needs.prepare.outputs.version }}
+          path: release-assets
+
+      - name: Download KMP publication evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: kalium-kmp-evidence-${{ needs.prepare.outputs.version }}
+          path: release-assets
+
+      - name: Upload assets and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          KMP_SHA: ${{ needs.prepare.outputs.kmp_sha }}
+          LITE_SHA: ${{ needs.prepare.outputs.lite_sha }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "# Kalium fork $VERSION"
+            echo
+            echo "Deterministic, immutable fork publication completed successfully."
+            echo
+            echo "- KMP upstream SHA: \`$KMP_SHA\`"
+            echo "- Lite upstream SHA: \`$LITE_SHA\`"
+            echo "- Pipeline commit: \`$GITHUB_SHA\`"
+            echo "- Maven feed: \`$KALIUM_PUBLISH_URL\`"
+            echo "- Smoke: \`com.wire.kalium:logic:$VERSION\` resolved from a clean Gradle home and selected \`logic-jvm\` through GMM."
+            echo "- Required variants: JVM, Android, iOS arm64, and iOS simulator arm64 verified for all 22 published modules."
+          } > "$notes"
+
+          gh release upload "$TAG" release-assets/* \
+            --repo "$GITHUB_REPOSITORY"
+          release_id="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              | jq -r --arg tag "$TAG" '.[] | select(.tag_name == $tag) | .id' \
+              | head -1
+          )"
+          test -n "$release_id"
+          gh api --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            --raw-field body="$(< "$notes")" \
+            --field draft=false \
+            --raw-field make_latest=false \
+            --silent
+
+  mark-failure:
+    name: Record failed reserved version
+    needs:
+      - prepare
+      - lite
+      - kmp
+    if: >-
+      always()
+      && needs.prepare.result == 'success'
+      && needs.prepare.outputs.dry_run == 'false'
+      && (needs.lite.result != 'success' || needs.kmp.result != 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark the draft as failed and immutable
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          KMP_SHA: ${{ needs.prepare.outputs.kmp_sha }}
+          LITE_SHA: ${{ needs.prepare.outputs.lite_sha }}
+        run: |
+          notes="$RUNNER_TEMP/release-failed.md"
+          {
+            echo "# Kalium fork $VERSION — FAILED"
+            echo
+            echo "This version was reserved but the publication did not complete."
+            echo "Do not retry or republish it; use the next wireN version."
+            echo
+            echo "- KMP upstream SHA: \`$KMP_SHA\`"
+            echo "- Lite upstream SHA: \`$LITE_SHA\`"
+            echo "- Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > "$notes"
+          release_id="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              | jq -r --arg tag "$TAG" '.[] | select(.tag_name == $tag) | .id' \
+              | head -1
+          )"
+          test -n "$release_id"
+          gh api --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            --raw-field body="$(< "$notes")" \
+            --silent
