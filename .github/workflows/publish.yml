@@ -6,7 +6,7 @@ on:
       version:
         description: "Immutable coordinate version (YYYY.MM.DD.wireN)"
         required: true
-        default: "2026.07.26.wire3"
+        default: "2026.07.26.wire4"
         type: string
       upstream_kmp_sha:
         description: "Exact mirrored wireapp/kalium develop SHA"
@@ -51,6 +51,7 @@ jobs:
       lite_sha: ${{ steps.release.outputs.lite_sha }}
       dry_run: ${{ steps.release.outputs.dry_run }}
       tag: ${{ steps.release.outputs.tag }}
+      release_id: ${{ steps.reserve.outputs.release_id }}
     steps:
       - name: Resolve immutable release inputs
         id: release
@@ -178,6 +179,7 @@ jobs:
           esac
 
       - name: Reserve release version as a draft
+        id: reserve
         if: steps.release.outputs.dry_run == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -207,23 +209,18 @@ jobs:
               --silent
           fi
 
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --draft \
-            --title "Kalium $VERSION" \
-            --notes-file "$notes" \
-            --verify-tag
-
           release_id="$(
-            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              | jq -r --arg tag "$TAG" --arg name "Kalium $VERSION" '
-                  .[]
-                  | select(.tag_name == $tag or .name == $name)
-                  | .id
-                ' \
-              | head -1
+            gh api --method POST \
+              "repos/$GITHUB_REPOSITORY/releases" \
+              --raw-field tag_name="$TAG" \
+              --raw-field target_commitish="$GITHUB_SHA" \
+              --raw-field name="Kalium $VERSION" \
+              --raw-field body="$(< "$notes")" \
+              --field draft=true \
+              --jq '.id'
           )"
           test -n "$release_id"
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
 
   lite:
     name: Build Kalium Lite XCFramework
@@ -672,6 +669,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.prepare.outputs.version }}
           TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
           KMP_SHA: ${{ needs.prepare.outputs.kmp_sha }}
           LITE_SHA: ${{ needs.prepare.outputs.lite_sha }}
         run: |
@@ -692,18 +690,9 @@ jobs:
 
           gh release upload "$TAG" release-assets/* \
             --repo "$GITHUB_REPOSITORY"
-          release_id="$(
-            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              | jq -r --arg tag "$TAG" --arg name "Kalium $VERSION" '
-                  .[]
-                  | select(.tag_name == $tag or .name == $name)
-                  | .id
-                ' \
-              | head -1
-          )"
-          test -n "$release_id"
+          test -n "$RELEASE_ID"
           gh api --method PATCH \
-            "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
             --raw-field body="$(< "$notes")" \
             --field draft=false \
             --raw-field make_latest=false \
@@ -727,6 +716,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.prepare.outputs.version }}
           TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
           KMP_SHA: ${{ needs.prepare.outputs.kmp_sha }}
           LITE_SHA: ${{ needs.prepare.outputs.lite_sha }}
         run: |
@@ -741,17 +731,8 @@ jobs:
             echo "- Lite upstream SHA: \`$LITE_SHA\`"
             echo "- Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           } > "$notes"
-          release_id="$(
-            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              | jq -r --arg tag "$TAG" --arg name "Kalium $VERSION" '
-                  .[]
-                  | select(.tag_name == $tag or .name == $name)
-                  | .id
-                ' \
-              | head -1
-          )"
-          test -n "$release_id"
+          test -n "$RELEASE_ID"
           gh api --method PATCH \
-            "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
             --raw-field body="$(< "$notes")" \
             --silent
