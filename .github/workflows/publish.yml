@@ -6,7 +6,7 @@ on:
       version:
         description: "Immutable coordinate version (YYYY.MM.DD.wireN)"
         required: true
-        default: "2026.07.26.wire2"
+        default: "2026.07.26.wire3"
         type: string
       upstream_kmp_sha:
         description: "Exact mirrored wireapp/kalium develop SHA"
@@ -216,7 +216,11 @@ jobs:
 
           release_id="$(
             gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              | jq -r --arg tag "$TAG" '.[] | select(.tag_name == $tag) | .id' \
+              | jq -r --arg tag "$TAG" --arg name "Kalium $VERSION" '
+                  .[]
+                  | select(.tag_name == $tag or .name == $name)
+                  | .id
+                ' \
               | head -1
           )"
           test -n "$release_id"
