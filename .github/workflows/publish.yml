@@ -32,6 +32,11 @@ on:
         required: false
         default: ""
         type: string
+      recovery_evidence_run_id:
+        description: "Actions run containing validated KMP staging hashes (verify-existing only)"
+        required: false
+        default: ""
+        type: string
       recovery_release_id:
         description: "Reserved draft release ID to finalize (verify-existing only)"
         required: false
@@ -77,6 +82,7 @@ jobs:
           INPUT_LITE_SHA: ${{ inputs.upstream_lite_sha }}
           INPUT_MODE: ${{ inputs.mode }}
           RECOVERY_RUN_ID: ${{ inputs.recovery_run_id }}
+          RECOVERY_EVIDENCE_RUN_ID: ${{ inputs.recovery_evidence_run_id }}
           RECOVERY_RELEASE_ID: ${{ inputs.recovery_release_id }}
         run: |
           set -euo pipefail
@@ -118,6 +124,10 @@ jobs:
               dry_run="false"
               if ! [[ "$RECOVERY_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
                 echo "::error::verify-existing requires a numeric recovery_run_id."
+                exit 1
+              fi
+              if ! [[ "$RECOVERY_EVIDENCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+                echo "::error::verify-existing requires a numeric recovery_evidence_run_id."
                 exit 1
               fi
               if ! [[ "$RECOVERY_RELEASE_ID" =~ ^[1-9][0-9]*$ ]]; then
@@ -395,10 +405,8 @@ jobs:
     if: >-
       always()
       && needs.prepare.result == 'success'
-      && (
-        needs.prepare.outputs.mode == 'verify-existing'
-        || needs.lite.result == 'success'
-      )
+      && needs.prepare.outputs.mode != 'verify-existing'
+      && needs.lite.result == 'success'
     runs-on: macos-15
     timeout-minutes: 240
     env:
@@ -609,6 +617,7 @@ jobs:
             relative="$coordinate/$VERSION/$coordinate-$VERSION.module"
             mkdir -p "$remote/$coordinate/$VERSION"
             if ! curl --fail --silent --show-error \
+                --location \
                 --compressed \
                 --retry 12 --retry-all-errors --retry-delay 10 \
                 --user "$KALIUM_PUBLISH_ACTOR:$KALIUM_PUBLISH_TOKEN" \
@@ -626,6 +635,7 @@ jobs:
 
             pom_relative="$coordinate/$VERSION/$coordinate-$VERSION.pom"
             if ! curl --fail --silent --show-error \
+                --location \
                 --compressed \
                 --retry 12 --retry-all-errors --retry-delay 10 \
                 --user "$KALIUM_PUBLISH_ACTOR:$KALIUM_PUBLISH_TOKEN" \
@@ -784,6 +794,250 @@ jobs:
             echo "- Feed: \`$KALIUM_PUBLISH_URL\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  verify_existing:
+    name: Verify existing immutable KMP publication
+    needs: prepare
+    if: needs.prepare.outputs.mode == 'verify-existing'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      KMP_SHA: ${{ needs.prepare.outputs.kmp_sha }}
+      KALIUM_PUBLISH_ACTOR: ${{ github.actor }}
+      KALIUM_PUBLISH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download validated staging evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: kalium-kmp-evidence-${{ needs.prepare.outputs.version }}
+          path: reference-evidence
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.recovery_evidence_run_id }}
+
+      - name: Checkout exact mirrored KMP source for the clean smoke
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: adamjlow/kalium
+          ref: ${{ needs.prepare.outputs.kmp_sha }}
+          path: source
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@0b6dd653ba04f4f93bf581ec31e66cbd7dcb644d
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@6cfc8b8e8bb586cc164bef1c478c1eea3a4d6a19
+
+      - name: Verify evidence and source provenance
+        run: |
+          set -euo pipefail
+          publications="$GITHUB_WORKSPACE/reference-evidence/kalium-publications-$VERSION.txt"
+          manifest="$GITHUB_WORKSPACE/reference-evidence/kalium-staging-$VERSION.sha256"
+          test -s "$publications"
+          test -s "$manifest"
+          test "$(wc -l < "$publications" | tr -d ' ')" = "148"
+          test "$(git -C source rev-parse HEAD)" = "$KMP_SHA"
+          git -C source diff --exit-code
+
+      - name: Verify every remote GMM and POM against staged hashes
+        run: |
+          set -euo pipefail
+          publications="$GITHUB_WORKSPACE/reference-evidence/kalium-publications-$VERSION.txt"
+          manifest="$GITHUB_WORKSPACE/reference-evidence/kalium-staging-$VERSION.sha256"
+          remote="$GITHUB_WORKSPACE/kalium-remote-gmm-$VERSION"
+          verification_log="$GITHUB_WORKSPACE/kalium-gmm-verification-$VERSION.log"
+          mkdir -p "$remote"
+          : > "$verification_log"
+          failures=0
+
+          while IFS= read -r task_path; do
+            project_path="${task_path%%:publish*}"
+            publication="${task_path#*:publish}"
+            publication="${publication%PublicationToWireForkStagingRepository}"
+            artifact="${project_path//:/-}"
+            case "$publication" in
+              KotlinMultiplatform) coordinate="$artifact" ;;
+              *) coordinate="$artifact-$(printf '%s' "$publication" | tr '[:upper:]' '[:lower:]')" ;;
+            esac
+
+            directory="$remote/$coordinate/$VERSION"
+            mkdir -p "$directory"
+            for extension in module pom; do
+              relative="$coordinate/$VERSION/$coordinate-$VERSION.$extension"
+              destination="$remote/$relative"
+              if ! curl --fail --silent --show-error \
+                  --location --compressed \
+                  --retry 5 --retry-all-errors --retry-delay 5 \
+                  --user "$KALIUM_PUBLISH_ACTOR:$KALIUM_PUBLISH_TOKEN" \
+                  "$KALIUM_PUBLISH_URL/com/wire/kalium/$relative" \
+                  --output "$destination"; then
+                printf 'MISSING_%s coordinate=com.wire.kalium:%s:%s\n' \
+                  "$(printf '%s' "$extension" | tr '[:lower:]' '[:upper:]')" \
+                  "$coordinate" "$VERSION" | tee -a "$verification_log"
+                failures=$((failures + 1))
+                continue
+              fi
+
+              expected="$(
+                awk -v path="./com/wire/kalium/$relative" \
+                  '$2 == path { print $1; exit }' "$manifest"
+              )"
+              actual="$(sha256sum "$destination" | awk '{print $1}')"
+              if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
+                printf 'HASH_MISMATCH extension=%s coordinate=com.wire.kalium:%s:%s expected=%s actual=%s\n' \
+                  "$extension" "$coordinate" "$VERSION" "${expected:-missing}" "$actual" \
+                  | tee -a "$verification_log"
+                failures=$((failures + 1))
+              else
+                printf 'MATCH extension=%s coordinate=com.wire.kalium:%s:%s sha256=%s\n' \
+                  "$extension" "$coordinate" "$VERSION" "$actual" \
+                  >> "$verification_log"
+              fi
+            done
+
+            module_file="$directory/$coordinate-$VERSION.module"
+            if ! jq -e \
+                --arg coordinate "$coordinate" \
+                --arg version "$VERSION" '
+                  .formatVersion != null
+                  and .component.group == "com.wire.kalium"
+                  and .component.module == $coordinate
+                  and .component.version == $version
+                  and (.variants | type == "array")
+                ' "$module_file" >/dev/null; then
+              printf 'INVALID_GMM coordinate=com.wire.kalium:%s:%s\n' \
+                "$coordinate" "$VERSION" | tee -a "$verification_log"
+              failures=$((failures + 1))
+            fi
+          done < "$publications"
+
+          remote_module_count="$(find "$remote" -type f -name '*.module' | wc -l | tr -d ' ')"
+          remote_pom_count="$(find "$remote" -type f -name '*.pom' | wc -l | tr -d ' ')"
+          printf 'REMOTE_MODULE_COUNT=%s\nREMOTE_POM_COUNT=%s\n' \
+            "$remote_module_count" "$remote_pom_count" | tee -a "$verification_log"
+          if [ "$remote_module_count" != "148" ] || [ "$remote_pom_count" != "148" ]; then
+            failures=$((failures + 1))
+          fi
+
+          while IFS=$'\t' read -r dependency dependency_version; do
+            dependency_module="$remote/$dependency/$dependency_version/$dependency-$dependency_version.module"
+            if [ ! -s "$dependency_module" ]; then
+              printf 'REMOTE_GMM_GAP coordinate=com.wire.kalium:%s:%s\n' \
+                "$dependency" "$dependency_version" | tee -a "$verification_log"
+              failures=$((failures + 1))
+            fi
+          done < <(
+            find "$remote" -type f -name '*.module' -print0 \
+              | xargs -0 jq -r '
+                  .variants[]?.dependencies[]?
+                  | select(.group == "com.wire.kalium")
+                  | [.module, .version.requires]
+                  | @tsv
+                ' \
+              | sort -u
+          )
+
+          logic_module="$remote/logic/$VERSION/logic-$VERSION.module"
+          for variant in logic-jvm logic-android logic-iosarm64 logic-iossimulatorarm64; do
+            if ! jq -e --arg variant "$variant" '
+                any(.variants[]?; ."available-at".module == $variant)
+              ' "$logic_module" >/dev/null; then
+              printf 'LOGIC_VARIANT_GAP=%s\n' "$variant" | tee -a "$verification_log"
+              failures=$((failures + 1))
+            fi
+          done
+
+          (
+            cd "$remote"
+            find . -type f \( -name '*.module' -o -name '*.pom' \) -print0 \
+              | sort -z \
+              | xargs -0 sha256sum
+          ) > "$GITHUB_WORKSPACE/kalium-remote-gmm-$VERSION.sha256"
+
+          if [ "$failures" != "0" ]; then
+            echo "::error::$failures existing publication verification checks failed."
+            exit 1
+          fi
+
+      - name: Resolve logic from a clean remote environment
+        if: always()
+        env:
+          SMOKE_ACTOR: ${{ github.actor }}
+          SMOKE_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          smoke="$RUNNER_TEMP/kalium-smoke"
+          mkdir -p "$smoke"
+
+          cat > "$smoke/settings.gradle.kts" <<EOF
+          pluginManagement { repositories { gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven {
+                      url = uri("$KALIUM_PUBLISH_URL")
+                      credentials {
+                          username = System.getenv("SMOKE_ACTOR")
+                          password = System.getenv("SMOKE_TOKEN")
+                      }
+                      content { includeGroup("com.wire.kalium") }
+                  }
+              }
+          }
+          rootProject.name = "kalium-smoke"
+          EOF
+
+          cat > "$smoke/build.gradle.kts" <<EOF
+          plugins { id("java-library") }
+          dependencies {
+              implementation("com.wire.kalium:logic:$VERSION")
+          }
+          tasks.register("verifyKaliumResolution") {
+              doLast {
+                  val expected = "logic-jvm-$VERSION.jar"
+                  val resolved = configurations.compileClasspath.get().files.map { it.name }
+                  require(expected in resolved) {
+                      "Expected GMM to select \$expected, resolved: \$resolved"
+                  }
+                  println("RESOLVED_KALIUM_VARIANT=\$expected")
+              }
+          }
+          EOF
+
+          GRADLE_USER_HOME="$RUNNER_TEMP/kalium-smoke-gradle-home" \
+            "$GITHUB_WORKSPACE/source/gradlew" \
+              -p "$smoke" \
+              --no-daemon \
+              --refresh-dependencies \
+              verifyKaliumResolution \
+            | tee "$GITHUB_WORKSPACE/kalium-smoke-$VERSION.log"
+
+          grep -Fq "RESOLVED_KALIUM_VARIANT=logic-jvm-$VERSION.jar" \
+            "$GITHUB_WORKSPACE/kalium-smoke-$VERSION.log"
+
+      - name: Upload verified existing-publication evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: kalium-kmp-evidence-${{ needs.prepare.outputs.version }}
+          path: |
+            reference-evidence/kalium-publications-${{ needs.prepare.outputs.version }}.txt
+            reference-evidence/kalium-staging-${{ needs.prepare.outputs.version }}.sha256
+            kalium-smoke-${{ needs.prepare.outputs.version }}.log
+            kalium-gmm-verification-${{ needs.prepare.outputs.version }}.log
+            kalium-remote-gmm-${{ needs.prepare.outputs.version }}.sha256
+            kalium-remote-gmm-${{ needs.prepare.outputs.version }}/
+          if-no-files-found: error
+          retention-days: 7
+
   finalize:
     name: Publish GitHub Release
     needs:
@@ -865,12 +1119,12 @@ jobs:
     name: Finalize verified existing release
     needs:
       - prepare
-      - kmp
+      - verify_existing
     if: >-
       always()
       && needs.prepare.result == 'success'
       && needs.prepare.outputs.mode == 'verify-existing'
-      && needs.kmp.result == 'success'
+      && needs.verify_existing.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Download the previously built Lite release assets
