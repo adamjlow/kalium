@@ -609,6 +609,7 @@ jobs:
             relative="$coordinate/$VERSION/$coordinate-$VERSION.module"
             mkdir -p "$remote/$coordinate/$VERSION"
             if ! curl --fail --silent --show-error \
+                --compressed \
                 --retry 12 --retry-all-errors --retry-delay 10 \
                 --user "$KALIUM_PUBLISH_ACTOR:$KALIUM_PUBLISH_TOKEN" \
                 "$KALIUM_PUBLISH_URL/com/wire/kalium/$relative" \
@@ -618,9 +619,14 @@ jobs:
               failures=$((failures + 1))
               continue
             fi
+            if [ "$(xxd -p -l 2 "$remote/$relative")" = "1f8b" ]; then
+              gzip -dc "$remote/$relative" > "$remote/$relative.decompressed"
+              mv "$remote/$relative.decompressed" "$remote/$relative"
+            fi
 
             pom_relative="$coordinate/$VERSION/$coordinate-$VERSION.pom"
             if ! curl --fail --silent --show-error \
+                --compressed \
                 --retry 12 --retry-all-errors --retry-delay 10 \
                 --user "$KALIUM_PUBLISH_ACTOR:$KALIUM_PUBLISH_TOKEN" \
                 "$KALIUM_PUBLISH_URL/com/wire/kalium/$pom_relative" \
@@ -640,17 +646,26 @@ jobs:
 
             expected_canonical="$remote/$coordinate/$VERSION/expected.canonical.json"
             actual_canonical="$remote/$coordinate/$VERSION/actual.canonical.json"
-            jq --sort-keys . "$stage/$relative" > "$expected_canonical"
-            jq --sort-keys . "$remote/$relative" > "$actual_canonical"
-            if cmp -s "$expected_canonical" "$actual_canonical"; then
-              semantic_result="equal"
+            if jq --sort-keys . "$stage/$relative" > "$expected_canonical" \
+                && jq --sort-keys . "$remote/$relative" > "$actual_canonical"; then
+              if cmp -s "$expected_canonical" "$actual_canonical"; then
+                semantic_result="equal"
+              else
+                semantic_result="different"
+              fi
             else
-              semantic_result="different"
+              semantic_result="unparseable"
             fi
             {
               printf 'BYTE_MISMATCH coordinate=com.wire.kalium:%s:%s expected=%s actual=%s semantic=%s\n' \
                 "$coordinate" "$VERSION" "$expected" "$actual" "$semantic_result"
-              diff -u "$expected_canonical" "$actual_canonical" || true
+              if [ "$semantic_result" = "unparseable" ]; then
+                printf 'REMOTE_FILE_TYPE=%s\n' "$(file -b "$remote/$relative")"
+                printf 'REMOTE_PREFIX_HEX=%s\n' \
+                  "$(xxd -p -l 16 "$remote/$relative" | tr -d '\n')"
+              else
+                diff -u "$expected_canonical" "$actual_canonical" || true
+              fi
             } | tee -a "$verification_log"
             failures=$((failures + 1))
           done < "$publications"
