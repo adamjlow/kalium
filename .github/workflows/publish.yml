@@ -18,11 +18,25 @@ on:
         required: true
         default: "6e7128b03d512dcf596758871704f595730257f5"
         type: string
-      dry_run:
-        description: "Build and validate locally without publishing"
+      mode:
+        description: "dry-run, immutable publish, or read-only verification of an existing version"
         required: true
-        default: true
-        type: boolean
+        default: "dry-run"
+        type: choice
+        options:
+          - dry-run
+          - publish
+          - verify-existing
+      recovery_run_id:
+        description: "Actions run containing the Lite artifact (verify-existing only)"
+        required: false
+        default: ""
+        type: string
+      recovery_release_id:
+        description: "Reserved draft release ID to finalize (verify-existing only)"
+        required: false
+        default: ""
+        type: string
   push:
     tags:
       - "fork-v*.wire*"
@@ -49,6 +63,7 @@ jobs:
       version: ${{ steps.release.outputs.version }}
       kmp_sha: ${{ steps.release.outputs.kmp_sha }}
       lite_sha: ${{ steps.release.outputs.lite_sha }}
+      mode: ${{ steps.release.outputs.mode }}
       dry_run: ${{ steps.release.outputs.dry_run }}
       tag: ${{ steps.release.outputs.tag }}
       release_id: ${{ steps.reserve.outputs.release_id }}
@@ -60,7 +75,9 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_KMP_SHA: ${{ inputs.upstream_kmp_sha }}
           INPUT_LITE_SHA: ${{ inputs.upstream_lite_sha }}
-          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_MODE: ${{ inputs.mode }}
+          RECOVERY_RUN_ID: ${{ inputs.recovery_run_id }}
+          RECOVERY_RELEASE_ID: ${{ inputs.recovery_release_id }}
         run: |
           set -euo pipefail
 
@@ -74,12 +91,12 @@ jobs:
             esac
             kmp_sha="$PINNED_KMP_SHA"
             lite_sha="$PINNED_LITE_SHA"
-            dry_run="false"
+            mode="publish"
           else
             version="$INPUT_VERSION"
             kmp_sha="$INPUT_KMP_SHA"
             lite_sha="$INPUT_LITE_SHA"
-            dry_run="$INPUT_DRY_RUN"
+            mode="$INPUT_MODE"
           fi
 
           if ! [[ "$version" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.wire[1-9][0-9]*$ ]]; then
@@ -94,16 +111,32 @@ jobs:
             echo "::error::Lite ref must be a full lowercase 40-character SHA."
             exit 1
           fi
-          if [ "$dry_run" != "true" ] && [ "$dry_run" != "false" ]; then
-            echo "::error::dry_run must be true or false."
-            exit 1
-          fi
+          case "$mode" in
+            dry-run) dry_run="true" ;;
+            publish) dry_run="false" ;;
+            verify-existing)
+              dry_run="false"
+              if ! [[ "$RECOVERY_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+                echo "::error::verify-existing requires a numeric recovery_run_id."
+                exit 1
+              fi
+              if ! [[ "$RECOVERY_RELEASE_ID" =~ ^[1-9][0-9]*$ ]]; then
+                echo "::error::verify-existing requires a numeric recovery_release_id."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::Unknown mode '$mode'."
+              exit 1
+              ;;
+          esac
 
           tag="fork-v$version"
           {
             echo "version=$version"
             echo "kmp_sha=$kmp_sha"
             echo "lite_sha=$lite_sha"
+            echo "mode=$mode"
             echo "dry_run=$dry_run"
             echo "tag=$tag"
           } >> "$GITHUB_OUTPUT"
@@ -119,7 +152,7 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/commits/$LITE_SHA" --silent
 
       - name: Enforce version immutability
-        if: steps.release.outputs.dry_run == 'false'
+        if: steps.release.outputs.mode == 'publish'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.release.outputs.version }}
@@ -180,7 +213,7 @@ jobs:
 
       - name: Reserve release version as a draft
         id: reserve
-        if: steps.release.outputs.dry_run == 'false'
+        if: steps.release.outputs.mode == 'publish'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.release.outputs.version }}
@@ -207,24 +240,43 @@ jobs:
               --raw-field ref="refs/tags/$TAG" \
               --raw-field sha="$GITHUB_SHA" \
               --silent
+
+            tag_visible="false"
+            for attempt in $(seq 1 12); do
+              if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --silent; then
+                tag_visible="true"
+                break
+              fi
+              sleep 5
+            done
+            if [ "$tag_visible" != "true" ]; then
+              echo "::error::Reserved tag '$TAG' did not become readable."
+              exit 1
+            fi
           fi
 
-          release_id="$(
+          release_json="$(
             gh api --method POST \
               "repos/$GITHUB_REPOSITORY/releases" \
               --raw-field tag_name="$TAG" \
               --raw-field target_commitish="$GITHUB_SHA" \
               --raw-field name="Kalium $VERSION" \
               --raw-field body="$(< "$notes")" \
-              --field draft=true \
-              --jq '.id'
+              --field draft=true
           )"
+          release_id="$(jq -r '.id' <<< "$release_json")"
+          release_tag="$(jq -r '.tag_name' <<< "$release_json")"
           test -n "$release_id"
+          if [ "$release_tag" != "$TAG" ]; then
+            echo "::error::Draft release normalized '$TAG' to '$release_tag'."
+            exit 1
+          fi
           echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
 
   lite:
     name: Build Kalium Lite XCFramework
     needs: prepare
+    if: needs.prepare.outputs.mode != 'verify-existing'
     runs-on: macos-15
     timeout-minutes: 180
     env:
@@ -319,7 +371,8 @@ jobs:
           asset="KaliumNotificationExtension-$VERSION.xcframework.zip"
           ditto -c -k --sequesterRsrc --keepParent \
             "$xcf" "$GITHUB_WORKSPACE/$asset"
-          shasum -a 256 "$GITHUB_WORKSPACE/$asset" \
+          checksum="$(shasum -a 256 "$GITHUB_WORKSPACE/$asset" | awk '{print $1}')"
+          printf '%s  %s\n' "$checksum" "$asset" \
             > "$GITHUB_WORKSPACE/$asset.sha256"
           test -s "$GITHUB_WORKSPACE/$asset"
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
@@ -339,12 +392,20 @@ jobs:
     needs:
       - prepare
       - lite
+    if: >-
+      always()
+      && needs.prepare.result == 'success'
+      && (
+        needs.prepare.outputs.mode == 'verify-existing'
+        || needs.lite.result == 'success'
+      )
     runs-on: macos-15
     timeout-minutes: 240
     env:
       GRADLE_OPTS: "-Xmx4g -Dorg.gradle.workers.max=1 -Dorg.gradle.parallel=false"
       VERSION: ${{ needs.prepare.outputs.version }}
       KMP_SHA: ${{ needs.prepare.outputs.kmp_sha }}
+      MODE: ${{ needs.prepare.outputs.mode }}
       DRY_RUN: ${{ needs.prepare.outputs.dry_run }}
       KALIUM_PUBLISH_VERSION: ${{ needs.prepare.outputs.version }}
       KALIUM_PUBLISH_ACTOR: ${{ github.actor }}
@@ -512,9 +573,10 @@ jobs:
           done
 
       - name: Publish all publications to GitHub Packages
-        if: needs.prepare.outputs.dry_run == 'false'
+        if: needs.prepare.outputs.mode == 'publish'
         working-directory: source
         run: |
+          test "$MODE" = "publish"
           init="$GITHUB_WORKSPACE/pipeline/.github/actions/kalium-publish-init/init.gradle"
           ./gradlew --no-daemon \
             --init-script "$init" \
@@ -523,13 +585,16 @@ jobs:
             publishAllPublicationsToWireForkGitHubPackagesRepository
 
       - name: Verify remote GMM matches staged GMM
-        if: needs.prepare.outputs.dry_run == 'false'
+        if: needs.prepare.outputs.mode != 'dry-run'
         run: |
           set -euo pipefail
           publications="$RUNNER_TEMP/kalium-publications.txt"
           stage="$KALIUM_STAGING_URL/com/wire/kalium"
           remote="$RUNNER_TEMP/remote-gmm"
+          verification_log="$GITHUB_WORKSPACE/kalium-gmm-verification-$VERSION.log"
           mkdir -p "$remote"
+          : > "$verification_log"
+          failures=0
 
           while IFS= read -r task_path; do
             project_path="${task_path%%:publish*}"
@@ -543,18 +608,74 @@ jobs:
 
             relative="$coordinate/$VERSION/$coordinate-$VERSION.module"
             mkdir -p "$remote/$coordinate/$VERSION"
-            curl --fail --silent --show-error \
-              --retry 12 --retry-all-errors --retry-delay 10 \
-              --user "$KALIUM_PUBLISH_ACTOR:$KALIUM_PUBLISH_TOKEN" \
-              "$KALIUM_PUBLISH_URL/com/wire/kalium/$relative" \
-              --output "$remote/$relative"
+            if ! curl --fail --silent --show-error \
+                --retry 12 --retry-all-errors --retry-delay 10 \
+                --user "$KALIUM_PUBLISH_ACTOR:$KALIUM_PUBLISH_TOKEN" \
+                "$KALIUM_PUBLISH_URL/com/wire/kalium/$relative" \
+                --output "$remote/$relative"; then
+              printf 'MISSING_GMM coordinate=com.wire.kalium:%s:%s\n' \
+                "$coordinate" "$VERSION" | tee -a "$verification_log"
+              failures=$((failures + 1))
+              continue
+            fi
+
+            pom_relative="$coordinate/$VERSION/$coordinate-$VERSION.pom"
+            if ! curl --fail --silent --show-error \
+                --retry 12 --retry-all-errors --retry-delay 10 \
+                --user "$KALIUM_PUBLISH_ACTOR:$KALIUM_PUBLISH_TOKEN" \
+                "$KALIUM_PUBLISH_URL/com/wire/kalium/$pom_relative" \
+                --output "$remote/$coordinate/$VERSION/$coordinate-$VERSION.pom"; then
+              printf 'MISSING_POM coordinate=com.wire.kalium:%s:%s\n' \
+                "$coordinate" "$VERSION" | tee -a "$verification_log"
+              failures=$((failures + 1))
+            fi
 
             expected="$(shasum -a 256 "$stage/$relative" | awk '{print $1}')"
             actual="$(shasum -a 256 "$remote/$relative" | awk '{print $1}')"
-            test "$actual" = "$expected"
+            if [ "$actual" = "$expected" ]; then
+              printf 'MATCH coordinate=com.wire.kalium:%s:%s sha256=%s\n' \
+                "$coordinate" "$VERSION" "$actual" >> "$verification_log"
+              continue
+            fi
+
+            expected_canonical="$remote/$coordinate/$VERSION/expected.canonical.json"
+            actual_canonical="$remote/$coordinate/$VERSION/actual.canonical.json"
+            jq --sort-keys . "$stage/$relative" > "$expected_canonical"
+            jq --sort-keys . "$remote/$relative" > "$actual_canonical"
+            if cmp -s "$expected_canonical" "$actual_canonical"; then
+              semantic_result="equal"
+            else
+              semantic_result="different"
+            fi
+            {
+              printf 'BYTE_MISMATCH coordinate=com.wire.kalium:%s:%s expected=%s actual=%s semantic=%s\n' \
+                "$coordinate" "$VERSION" "$expected" "$actual" "$semantic_result"
+              diff -u "$expected_canonical" "$actual_canonical" || true
+            } | tee -a "$verification_log"
+            failures=$((failures + 1))
           done < "$publications"
 
+          remote_module_count="$(find "$remote" -type f -name '*.module' | wc -l | tr -d ' ')"
+          printf 'REMOTE_MODULE_COUNT=%s\n' "$remote_module_count" | tee -a "$verification_log"
+          if [ "$remote_module_count" != "148" ]; then
+            failures=$((failures + 1))
+          fi
+
+          (
+            cd "$remote"
+            find . -type f \( -name '*.module' -o -name '*.pom' \) -print0 \
+              | sort -z \
+              | xargs -0 shasum -a 256
+          ) > "$GITHUB_WORKSPACE/kalium-remote-gmm-$VERSION.sha256"
+          cp -R "$remote" "$GITHUB_WORKSPACE/kalium-remote-gmm-$VERSION"
+
+          if [ "$failures" != "0" ]; then
+            echo "::error::$failures remote publication verification checks failed."
+            exit 1
+          fi
+
       - name: Resolve logic from a clean environment
+        if: always()
         env:
           SMOKE_ACTOR: ${{ github.actor }}
           SMOKE_TOKEN: ${{ github.token }}
@@ -621,6 +742,7 @@ jobs:
             "$GITHUB_WORKSPACE/kalium-smoke-$VERSION.log"
 
       - name: Upload publication evidence
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: kalium-kmp-evidence-${{ needs.prepare.outputs.version }}
@@ -628,6 +750,9 @@ jobs:
             kalium-publications-${{ needs.prepare.outputs.version }}.txt
             kalium-staging-${{ needs.prepare.outputs.version }}.sha256
             kalium-smoke-${{ needs.prepare.outputs.version }}.log
+            kalium-gmm-verification-${{ needs.prepare.outputs.version }}.log
+            kalium-remote-gmm-${{ needs.prepare.outputs.version }}.sha256
+            kalium-remote-gmm-${{ needs.prepare.outputs.version }}/
           if-no-files-found: error
           retention-days: 7
 
@@ -639,6 +764,7 @@ jobs:
             echo
             echo "- Version: \`$VERSION\`"
             echo "- KMP SHA: \`$KMP_SHA\`"
+            echo "- Mode: \`$MODE\`"
             echo "- Dry run: \`$DRY_RUN\`"
             echo "- Feed: \`$KALIUM_PUBLISH_URL\`"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -649,20 +775,20 @@ jobs:
       - prepare
       - lite
       - kmp
-    if: needs.prepare.outputs.dry_run == 'false'
+    if: needs.prepare.outputs.mode == 'publish'
     runs-on: ubuntu-latest
     steps:
       - name: Download Lite release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: kalium-lite-${{ needs.prepare.outputs.version }}
-          path: release-assets
+          path: release-assets/lite
 
       - name: Download KMP publication evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: kalium-kmp-evidence-${{ needs.prepare.outputs.version }}
-          path: release-assets
+          path: release-assets/evidence
 
       - name: Upload assets and publish release
         env:
@@ -688,15 +814,155 @@ jobs:
             echo "- Required variants: JVM, Android, iOS arm64, and iOS simulator arm64 verified for all 22 published modules."
           } > "$notes"
 
-          gh release upload "$TAG" release-assets/* \
-            --repo "$GITHUB_REPOSITORY"
           test -n "$RELEASE_ID"
+          tar -C release-assets/evidence -czf \
+            "release-assets/kalium-publication-evidence-$VERSION.tar.gz" .
+
+          existing_assets="$(
+            gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" \
+              --jq '.[].name'
+          )"
+          for asset in release-assets/lite/* "release-assets/kalium-publication-evidence-$VERSION.tar.gz"; do
+            name="$(basename "$asset")"
+            if grep -Fxq "$name" <<< "$existing_assets"; then
+              echo "::error::Release asset '$name' already exists."
+              exit 1
+            fi
+            encoded_name="$(jq -rn --arg name "$name" '$name | @uri')"
+            curl --fail-with-body --silent --show-error \
+              --request POST \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Content-Type: application/octet-stream" \
+              --data-binary "@$asset" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$encoded_name" \
+              >/dev/null
+          done
+
           gh api --method PATCH \
             "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            --raw-field tag_name="$TAG" \
             --raw-field body="$(< "$notes")" \
             --field draft=false \
             --raw-field make_latest=false \
             --silent
+
+  recover-existing:
+    name: Finalize verified existing release
+    needs:
+      - prepare
+      - kmp
+    if: >-
+      always()
+      && needs.prepare.result == 'success'
+      && needs.prepare.outputs.mode == 'verify-existing'
+      && needs.kmp.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the previously built Lite release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: kalium-lite-${{ needs.prepare.outputs.version }}
+          path: release-assets/lite
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.recovery_run_id }}
+
+      - name: Download verified KMP publication evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: kalium-kmp-evidence-${{ needs.prepare.outputs.version }}
+          path: release-assets/evidence
+
+      - name: Validate and normalize the recovered Lite assets
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd release-assets/lite
+          asset="KaliumNotificationExtension-$VERSION.xcframework.zip"
+          checksum_file="$asset.sha256"
+          test -s "$asset"
+          test -s "$checksum_file"
+
+          expected="$(awk '{print $1}' "$checksum_file")"
+          actual="$(shasum -a 256 "$asset" | awk '{print $1}')"
+          test "$actual" = "$expected"
+          printf '%s  %s\n' "$actual" "$asset" > "$checksum_file"
+
+          listing="$(unzip -Z1 "$asset")"
+          for slice in ios-arm64 ios-arm64-simulator macos-arm64; do
+            grep -Fq "KaliumNotificationExtension.xcframework/$slice/" <<< "$listing"
+          done
+          grep -Fxq "KaliumNotificationExtension.xcframework/Info.plist" <<< "$listing"
+
+      - name: Upload recovered assets and publish the verified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_ID: ${{ inputs.recovery_release_id }}
+          KMP_SHA: ${{ needs.prepare.outputs.kmp_sha }}
+          LITE_SHA: ${{ needs.prepare.outputs.lite_sha }}
+          ORIGINAL_RUN_ID: ${{ inputs.recovery_run_id }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_ID"
+
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
+          test "$(jq -r '.draft' <<< "$release_json")" = "true"
+          test "$(jq -r '.name' <<< "$release_json")" = "Kalium $VERSION"
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --silent
+
+          notes="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "# Kalium fork $VERSION"
+            echo
+            echo "Deterministic, immutable fork publication completed and was independently re-verified."
+            echo
+            echo "- KMP upstream SHA: \`$KMP_SHA\`"
+            echo "- Lite upstream SHA: \`$LITE_SHA\`"
+            echo "- Maven feed: \`$KALIUM_PUBLISH_URL\`"
+            echo "- Original package run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$ORIGINAL_RUN_ID"
+            echo "- Verification run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "- Smoke: \`com.wire.kalium:logic:$VERSION\` resolved from a clean Gradle home and selected \`logic-jvm\` through GMM."
+            echo "- Required variants: JVM, Android, iOS arm64, and iOS simulator arm64 verified for all 22 published modules."
+          } > "$notes"
+
+          tar -C release-assets/evidence -czf \
+            "release-assets/kalium-publication-evidence-$VERSION.tar.gz" .
+
+          existing_assets="$(
+            gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" \
+              --jq '.[].name'
+          )"
+          for asset in release-assets/lite/* "release-assets/kalium-publication-evidence-$VERSION.tar.gz"; do
+            name="$(basename "$asset")"
+            if grep -Fxq "$name" <<< "$existing_assets"; then
+              echo "::error::Release asset '$name' already exists."
+              exit 1
+            fi
+            encoded_name="$(jq -rn --arg name "$name" '$name | @uri')"
+            curl --fail-with-body --silent --show-error \
+              --request POST \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Content-Type: application/octet-stream" \
+              --data-binary "@$asset" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$encoded_name" \
+              >/dev/null
+          done
+
+          gh api --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            --raw-field tag_name="$TAG" \
+            --raw-field body="$(< "$notes")" \
+            --field draft=false \
+            --raw-field make_latest=false \
+            --silent
+
+          published="$(
+            gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+              --jq '[.draft, .tag_name] | @tsv'
+          )"
+          test "$published" = $'false\t'"$TAG"
 
   mark-failure:
     name: Record failed reserved version
@@ -707,7 +973,7 @@ jobs:
     if: >-
       always()
       && needs.prepare.result == 'success'
-      && needs.prepare.outputs.dry_run == 'false'
+      && needs.prepare.outputs.mode == 'publish'
       && (needs.lite.result != 'success' || needs.kmp.result != 'success')
     runs-on: ubuntu-latest
     steps:
