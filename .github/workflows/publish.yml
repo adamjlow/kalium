@@ -902,14 +902,23 @@ jobs:
             done
 
             module_file="$directory/$coordinate-$VERSION.module"
+            root_module_url="../../$artifact/$VERSION/$artifact-$VERSION.module"
             if ! jq -e \
+                --arg artifact "$artifact" \
                 --arg coordinate "$coordinate" \
-                --arg version "$VERSION" '
+                --arg version "$VERSION" \
+                --arg root_module_url "$root_module_url" '
                   .formatVersion != null
                   and .component.group == "com.wire.kalium"
-                  and .component.module == $coordinate
+                  and .component.module == $artifact
                   and .component.version == $version
                   and (.variants | type == "array")
+                  and (
+                    if $coordinate == $artifact
+                    then (.component.url? == null)
+                    else .component.url == $root_module_url
+                    end
+                  )
                 ' "$module_file" >/dev/null; then
               printf 'INVALID_GMM coordinate=com.wire.kalium:%s:%s\n' \
                 "$coordinate" "$VERSION" | tee -a "$verification_log"
