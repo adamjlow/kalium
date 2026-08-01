@@ -1,0 +1,9 @@
+# iron-forge:begin
+[mcp_servers.iron-forge]
+command = "iron-forge"
+args = ["mcp", "--project-from-cwd", "--client", "codex"]
+required = true
+default_tools_approval_mode = "writes"
+startup_timeout_sec = 15
+tool_timeout_sec = 90
+# iron-forge:end

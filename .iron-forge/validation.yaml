@@ -1,0 +1,15 @@
+version: 1
+confirmed: true
+defaultProfile: host-default
+profiles:
+  host-default:
+    revision: 1
+    environment: environment_local
+    timeoutSeconds: 1800
+    commands:
+      - id: repository-diff-safety
+        displayName: Repository diff safety
+        executable: git
+        args: [diff, --check, HEAD^, HEAD]
+        requiredPaths: []
+        evidencePaths: []

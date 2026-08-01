@@ -293,3 +293,13 @@ Adhere to the following guidelines for each session:
 
 ### 7. Run linter before finishing
 - `./gradlew detekt` — must pass on all changed files.
+
+<!-- iron-forge:begin -->
+
+## Iron Forge
+
+For live project status, governed proposals, approvals, Runs, or Jobs, follow
+the `iron-forge-operating` skill and use the native Iron Forge MCP tools.
+Status questions are read-only. Never treat this file or a desktop transcript
+as orchestration state.
+<!-- iron-forge:end -->

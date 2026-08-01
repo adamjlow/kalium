@@ -1,0 +1,26 @@
+{
+  "installedTemplateVersion": "0.7.2",
+  "frameworkOwned": [
+    ".agents/skills/iron-forge-coordination/SKILL.md",
+    ".agents/skills/iron-forge-execution/SKILL.md",
+    ".agents/skills/iron-forge-operating/SKILL.md",
+    ".iron-forge/version"
+  ],
+  "userOwned": [
+    ".iron-forge/environments.yaml",
+    ".iron-forge/project.yaml",
+    ".iron-forge/validation.yaml"
+  ],
+  "mergeManaged": [
+    ".codex/config.toml",
+    ".mcp.json",
+    "AGENTS.md",
+    "CLAUDE.md"
+  ],
+  "contentHashes": {
+    ".agents/skills/iron-forge-coordination/SKILL.md": "4a9589263fd8bcd0123affcc0afdbba33f251ff17d3605d7a397448641f1be0a",
+    ".agents/skills/iron-forge-execution/SKILL.md": "f4cc9dc856a674ed51e5902dcb88d413652f1fae5e6786625dff1815a452ece6",
+    ".agents/skills/iron-forge-operating/SKILL.md": "b0a349657f0d6a297b072144e00e911238bee532a10069e1e451aa0a69ae7f60",
+    ".iron-forge/version": "d0176718bd214ce8474c06ed61c395ca113fdfc2acdd86d9aa9933b40d9b561e"
+  }
+}
