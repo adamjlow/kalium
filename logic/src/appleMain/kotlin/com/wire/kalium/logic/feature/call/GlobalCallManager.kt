@@ -64,7 +64,7 @@ internal actual class GlobalCallManager actual constructor(
     private val mediaManagerService by lazy { MediaManagerServiceImpl(platformContext) }
     private var hasEnabledCallingClient = false
 
-    @Suppress("LongParameterList")
+    @Suppress("LongParameterList", "ReturnCount")
     internal actual fun getCallManagerForClient(
         userId: QualifiedID,
         callRepository: CallRepository,
@@ -86,6 +86,11 @@ internal actual class GlobalCallManager actual constructor(
     ): CallManager {
         if (!kaliumConfigs.enableCalling) {
             kaliumLogger.w("Calls disabled by KaliumConfigs.enableCalling=false: using Apple no-op CallManager")
+            return DisabledAppleCallManager
+        }
+
+        if (!AppleAvs.bridge.startIfAvailable()) {
+            kaliumLogger.w("AVS is unavailable in this build: using Apple no-op CallManager")
             return DisabledAppleCallManager
         }
 
