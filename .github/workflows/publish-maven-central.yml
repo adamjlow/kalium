@@ -82,6 +82,7 @@ jobs:
         run: |
           ./gradlew publishAllPublicationsToMavenCentralStagingRepository \
             -PUSE_UNIFIED_CORE_CRYPTO=true \
+            -Pkalium.disableAppleAvs=false \
             -Pkalium.publish.version="$KALIUM_PUBLISH_VERSION" \
             -Pkalium.mavenCentral.signingRequired=true
 

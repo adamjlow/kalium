@@ -489,6 +489,7 @@ jobs:
           ./gradlew --no-daemon --console=plain --quiet \
             --init-script "$init" \
             -PUSE_UNIFIED_CORE_CRYPTO=true \
+            -Pkalium.disableAppleAvs=false \
             -Pkalium.publish.version="$VERSION" \
             tasks --all > "$tasks_file"
 
@@ -522,6 +523,7 @@ jobs:
           ./gradlew --no-daemon \
             --init-script "$init" \
             -PUSE_UNIFIED_CORE_CRYPTO=true \
+            -Pkalium.disableAppleAvs=false \
             -Pkalium.publish.version="$VERSION" \
             publishAllPublicationsToWireForkStagingRepository
 
@@ -580,6 +582,110 @@ jobs:
             ' "$logic_module" >/dev/null
           done
 
+          avs_version="$(
+            awk -F '"' '/^avs-kmp = / { print $2; exit }' \
+              "$GITHUB_WORKSPACE/source/gradle/libs.versions.toml"
+          )"
+          test -n "$avs_version"
+          for coordinate in \
+            logic-iosarm64 \
+            logic-iossimulatorarm64 \
+            domain-calling-iosarm64 \
+            domain-calling-iossimulatorarm64; do
+            module_file="$stage/$coordinate/$VERSION/$coordinate-$VERSION.module"
+            if ! jq -e --arg avs_version "$avs_version" '
+                any(
+                  .variants[]?.dependencies[]?;
+                  .group == "com.wire"
+                  and .module == "avs-kmp"
+                  and .version.requires == $avs_version
+                )
+              ' "$module_file" >/dev/null; then
+              echo "::error::$coordinate does not publish com.wire:avs-kmp:$avs_version."
+              exit 1
+            fi
+          done
+
+      - name: Link AVS-enabled logic from clean local staging
+        run: |
+          set -euo pipefail
+          smoke="$RUNNER_TEMP/kalium-ios-smoke"
+          mkdir -p "$smoke"
+
+          kotlin_version="$(
+            awk -F '"' '/^kotlin = / { print $2; exit }' \
+              "$GITHUB_WORKSPACE/source/gradle/libs.versions.toml"
+          )"
+          test -n "$kotlin_version"
+
+          cat > "$smoke/settings.gradle.kts" <<EOF
+          pluginManagement {
+              repositories {
+                  gradlePluginPortal()
+                  google()
+                  mavenCentral()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven {
+                      url = uri("$KALIUM_STAGING_URL")
+                      content { includeGroup("com.wire.kalium") }
+                  }
+              }
+          }
+          rootProject.name = "kalium-ios-avs-smoke"
+          EOF
+
+          cat > "$smoke/build.gradle.kts" <<EOF
+          plugins {
+              id("org.jetbrains.kotlin.multiplatform") version "$kotlin_version"
+          }
+
+          val kaliumLogic = "com.wire.kalium:logic:$VERSION"
+
+          kotlin {
+              val appleTargets = listOf(iosArm64(), iosSimulatorArm64())
+              appleTargets.forEach { target ->
+                  target.binaries.framework {
+                      baseName = "KaliumAvsSmoke"
+                      isStatic = false
+                      export(kaliumLogic)
+                  }
+              }
+              sourceSets {
+                  commonMain.dependencies {
+                      api(kaliumLogic)
+                  }
+              }
+          }
+          EOF
+
+          clean_gradle_home="$RUNNER_TEMP/kalium-ios-smoke-gradle-home"
+          GRADLE_USER_HOME="$clean_gradle_home" \
+            "$GITHUB_WORKSPACE/source/gradlew" \
+              -p "$smoke" \
+              --no-daemon \
+              --refresh-dependencies \
+              linkReleaseFrameworkIosArm64 \
+              linkReleaseFrameworkIosSimulatorArm64 \
+            | tee "$GITHUB_WORKSPACE/kalium-ios-avs-smoke-$VERSION.log"
+
+          for target in iosArm64 iosSimulatorArm64; do
+            binary="$smoke/build/bin/$target/releaseFramework/KaliumAvsSmoke.framework/KaliumAvsSmoke"
+            test -s "$binary"
+            if ! nm "$binary" | grep -Eq '[[:space:]][Tt][[:space:]]_?wcall_setup$'; then
+              echo "::error::AVS symbol wcall_setup is not linked into the $target smoke framework."
+              exit 1
+            fi
+            printf 'LINKED_AVS_SYMBOL target=%s symbol=wcall_setup binary=%s\n' \
+              "$target" "$binary" \
+              | tee -a "$GITHUB_WORKSPACE/kalium-ios-avs-smoke-$VERSION.log"
+          done
+
       - name: Publish all publications to GitHub Packages
         if: needs.prepare.outputs.mode == 'publish'
         working-directory: source
@@ -589,6 +695,7 @@ jobs:
           ./gradlew --no-daemon \
             --init-script "$init" \
             -PUSE_UNIFIED_CORE_CRYPTO=true \
+            -Pkalium.disableAppleAvs=false \
             -Pkalium.publish.version="$VERSION" \
             publishAllPublicationsToWireForkGitHubPackagesRepository
 
@@ -775,6 +882,7 @@ jobs:
             kalium-publications-${{ needs.prepare.outputs.version }}.txt
             kalium-staging-${{ needs.prepare.outputs.version }}.sha256
             kalium-smoke-${{ needs.prepare.outputs.version }}.log
+            kalium-ios-avs-smoke-${{ needs.prepare.outputs.version }}.log
             kalium-gmm-verification-${{ needs.prepare.outputs.version }}.log
             kalium-remote-gmm-${{ needs.prepare.outputs.version }}.sha256
             kalium-remote-gmm-${{ needs.prepare.outputs.version }}/
@@ -839,9 +947,14 @@ jobs:
           set -euo pipefail
           publications="$GITHUB_WORKSPACE/reference-evidence/kalium-publications-$VERSION.txt"
           manifest="$GITHUB_WORKSPACE/reference-evidence/kalium-staging-$VERSION.sha256"
+          ios_smoke="$GITHUB_WORKSPACE/reference-evidence/kalium-ios-avs-smoke-$VERSION.log"
           test -s "$publications"
           test -s "$manifest"
+          test -s "$ios_smoke"
           test "$(wc -l < "$publications" | tr -d ' ')" = "148"
+          for target in iosArm64 iosSimulatorArm64; do
+            grep -Fq "LINKED_AVS_SYMBOL target=$target symbol=wcall_setup" "$ios_smoke"
+          done
           test "$(git -C source rev-parse HEAD)" = "$KMP_SHA"
           git -C source diff --exit-code
 
@@ -962,6 +1075,31 @@ jobs:
             fi
           done
 
+          avs_version="$(
+            awk -F '"' '/^avs-kmp = / { print $2; exit }' \
+              "$GITHUB_WORKSPACE/source/gradle/libs.versions.toml"
+          )"
+          test -n "$avs_version"
+          for coordinate in \
+            logic-iosarm64 \
+            logic-iossimulatorarm64 \
+            domain-calling-iosarm64 \
+            domain-calling-iossimulatorarm64; do
+            module_file="$remote/$coordinate/$VERSION/$coordinate-$VERSION.module"
+            if ! jq -e --arg avs_version "$avs_version" '
+                any(
+                  .variants[]?.dependencies[]?;
+                  .group == "com.wire"
+                  and .module == "avs-kmp"
+                  and .version.requires == $avs_version
+                )
+              ' "$module_file" >/dev/null; then
+              printf 'APPLE_AVS_DEPENDENCY_GAP=%s expected=%s\n' \
+                "$coordinate" "$avs_version" | tee -a "$verification_log"
+              failures=$((failures + 1))
+            fi
+          done
+
           (
             cd "$remote"
             find . -type f \( -name '*.module' -o -name '*.pom' \) -print0 \
@@ -1040,6 +1178,7 @@ jobs:
           path: |
             reference-evidence/kalium-publications-${{ needs.prepare.outputs.version }}.txt
             reference-evidence/kalium-staging-${{ needs.prepare.outputs.version }}.sha256
+            reference-evidence/kalium-ios-avs-smoke-${{ needs.prepare.outputs.version }}.log
             kalium-smoke-${{ needs.prepare.outputs.version }}.log
             kalium-gmm-verification-${{ needs.prepare.outputs.version }}.log
             kalium-remote-gmm-${{ needs.prepare.outputs.version }}.sha256
@@ -1089,6 +1228,7 @@ jobs:
             echo "- Pipeline commit: \`$GITHUB_SHA\`"
             echo "- Maven feed: \`$KALIUM_PUBLISH_URL\`"
             echo "- Smoke: \`com.wire.kalium:logic:$VERSION\` resolved from a clean Gradle home and selected \`logic-jvm\` through GMM."
+            echo "- Apple AVS: \`com.wire:avs-kmp\` metadata and linked \`wcall_setup\` symbols verified for iOS device and simulator."
             echo "- Required variants: JVM, Android, iOS arm64, and iOS simulator arm64 verified for all 22 published modules."
           } > "$notes"
 
@@ -1202,6 +1342,7 @@ jobs:
             echo "- Original package run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$ORIGINAL_RUN_ID"
             echo "- Verification run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
             echo "- Smoke: \`com.wire.kalium:logic:$VERSION\` resolved from a clean Gradle home and selected \`logic-jvm\` through GMM."
+            echo "- Apple AVS: \`com.wire:avs-kmp\` metadata and linked \`wcall_setup\` symbols verified for iOS device and simulator."
             echo "- Required variants: JVM, Android, iOS arm64, and iOS simulator arm64 verified for all 22 published modules."
           } > "$notes"
 
