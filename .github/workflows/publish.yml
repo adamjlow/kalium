@@ -348,7 +348,7 @@ jobs:
           ./gradlew --no-daemon \
             -PUSE_UNIFIED_CORE_CRYPTO=true \
             -Pkalium.publish.version="$VERSION" \
-            :logic:notification-extension:assembleKaliumNotificationExtensionXCFramework
+            :logic:notification-extension:assembleKaliumNotificationExtensionReleaseXCFramework
 
       - name: Validate and package release XCFramework
         id: package
