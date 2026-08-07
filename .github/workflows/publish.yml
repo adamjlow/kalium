@@ -689,8 +689,10 @@ jobs:
 
           for target in iosArm64 iosSimulatorArm64; do
             binary="$smoke/build/bin/$target/releaseFramework/KaliumAvsSmoke.framework/KaliumAvsSmoke"
+            symbols="$smoke/build/bin/$target/releaseFramework/KaliumAvsSmoke.symbols"
             test -s "$binary"
-            if ! nm "$binary" | grep -Eq '[[:space:]][Tt][[:space:]]_?wcall_setup$'; then
+            nm "$binary" > "$symbols"
+            if ! grep -Eq '[[:space:]][Tt][[:space:]]_?wcall_setup$' "$symbols"; then
               echo "::error::AVS symbol wcall_setup is not linked into the $target smoke framework."
               exit 1
             fi
