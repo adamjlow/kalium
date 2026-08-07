@@ -647,6 +647,12 @@ jobs:
           public fun smokeAnchor(): String = "kalium-ios-avs-smoke"
           EOF
 
+          cat > "$smoke/gradle.properties" <<'EOF'
+          org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g
+          org.gradle.workers.max=1
+          org.gradle.parallel=false
+          EOF
+
           cat > "$smoke/build.gradle.kts" <<EOF
           plugins {
               id("org.jetbrains.kotlin.multiplatform") version "$kotlin_version"
