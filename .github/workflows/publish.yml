@@ -640,6 +640,13 @@ jobs:
           rootProject.name = "kalium-ios-avs-smoke"
           EOF
 
+          mkdir -p "$smoke/src/commonMain/kotlin"
+          cat > "$smoke/src/commonMain/kotlin/SmokeAnchor.kt" <<'EOF'
+          package smoke
+
+          public fun smokeAnchor(): String = "kalium-ios-avs-smoke"
+          EOF
+
           cat > "$smoke/build.gradle.kts" <<EOF
           plugins {
               id("org.jetbrains.kotlin.multiplatform") version "$kotlin_version"
@@ -807,7 +814,7 @@ jobs:
           fi
 
       - name: Resolve logic from a clean environment
-        if: always()
+        if: success()
         env:
           SMOKE_ACTOR: ${{ github.actor }}
           SMOKE_TOKEN: ${{ github.token }}
